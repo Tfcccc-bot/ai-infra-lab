@@ -136,19 +136,6 @@ dspark/
 
 ---
 
-## 🎓 面试追问预期
-
-1. **"DSpark 的半自回归和 EAGLE-3 的自回归 draft 有什么区别？"**
-   → DSpark 的 Parallel Backbone 一次性生成所有候选 token 的隐藏状态 (O(1) 延迟), 然后用轻量 Sequential Head 注入依赖。EAGLE-3 逐 token 自回归生成 (O(γ) 延迟)。DSpark 在位置 1 有更高的初始接受率, 且随块大小增加优势扩大。
-
-2. **"置信度调度器的 STS 校准具体怎么做？"**
-   → 对每个位置 k 独立执行 1D 网格搜索, 找到最小化 ECE 的最优温度 T_k。温度缩放是保序变换, 不破坏相对排序。最终 ECE 从 3-8% 降至 ~1%。
-
-3. **"在消费级 GPU 上部署遇到了什么挑战？"**
-   → 论文的 γ=15 需要更多显存, 我们压缩到 γ=5。KV cache 使用 FP16 存储, 批量验证融合到单个 kernel。SPS 查找表需要针对 RTX 4090 重新 profiling。
-
----
-
 ## 📚 参考
 
 - [DSpark 论文](https://arxiv.org/abs/2607.05147)

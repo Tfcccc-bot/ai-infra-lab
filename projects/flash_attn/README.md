@@ -65,10 +65,10 @@ flash_attn/
 
 ---
 
-## 🎓 面试追问预期
+## 🔬 技术洞察
 
-1. **"Warp-Specialized Pipeline 的本质区别？"** → 传统 kernel 所有 warp 执行相同代码 (SIMT)。FA4 不同 warp 执行不同角色 (Load/MMA/Softmax/Correction/Epilogue), 通过异步流水线最大化硬件利用率。
+**Warp-Specialized Pipeline**: 传统 CUDA kernel 所有 warp 执行相同代码 (SIMT 模型)。FA4 将不同 warp 分配不同角色 (Load/MMA/Softmax/Correction/Epilogue), 通过异步流水线实现计算与访存的最大重叠, 这是从"数据并行"到"任务并行"的范式转变。
 
-2. **"Hybrid Exponential 如何保证精度？"** → 三次多项式在 x∈[-1,1] 上拟合 2^x 的最大相对误差 <0.02%, 低于 BF16 的量化误差 (~0.4%)。且 softmax 的归一化操作会进一步稀释局部误差。
+**Hybrid Exponential 精度**: 三次多项式在 x∈[-1,1] 上拟合 2^x 的最大相对误差 <0.02%, 远低于 BF16 的量化误差 (~0.4%)。且 softmax 的归一化操作会进一步稀释局部近似误差。
 
-3. **"Hopper vs Blackwell 实现差异？"** → Blackwell 有 TMA (Tensor Memory Accelerator) 和 TMEM (Tensor Memory), 以及 5th-gen Tensor Cores (128x256x16 tiles)。我们的实现在 Hopper 上模拟这些特性, 核心流水线逻辑相同但使用 async copy + shared memory 替代。
+**Hopper vs Blackwell 适配**: Blackwell 的 TMA (Tensor Memory Accelerator)、TMEM (Tensor Memory) 和 5th-gen Tensor Cores 是 FA4 完整性能的基础。本实现在 Hopper 架构上通过 async copy + shared memory 模拟核心流水线逻辑。

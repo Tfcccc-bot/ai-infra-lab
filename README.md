@@ -13,7 +13,7 @@
 
 ## 📋 项目概述
 
-本项目对 **2025-2026 年 AI Infra 领域最前沿技术** 进行本地复现、优化和工程化实现，目标是为 AI Infra 工程师岗位面试提供有深度的技术展示。
+本项目对 **2025-2026 年 AI Infra 领域最新技术** 进行深入研究和工程实现，涵盖投机解码、极低比特量化与 Attention Kernel 优化三大方向，旨在推动大模型推理效率的前沿探索。
 
 ### 技术路线图
 
@@ -130,12 +130,6 @@ python projects/flash_attn/benchmark.py --impl warp_specialized
 - [DSpark 深度解析](docs/dspark_deep_dive.md)
 - [2-bit 量化综述](docs/quant_2bit_survey.md)
 - [FlashAttention-4 机制分析](docs/fa4_analysis.md)
-
----
-
-## 🎯 面试追问预期
-
-每个方向都准备了面试官可能追问的技术细节清单，详见各项目 README。
 
 ---
 
