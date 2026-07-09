@@ -1,0 +1,10 @@
+# AI Infra Lab
+
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+.DS_Store
