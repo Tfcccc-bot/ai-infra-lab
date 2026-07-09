@@ -24,6 +24,7 @@
 | **极低比特量化** | BBQ: Bell Box Quantization | ICLR 2026 | 🚧 |
 | **极低比特量化** | QAT for Ultra-Low-Bit Reasoning LLMs | ICLR 2026 | 📋 |
 | **Attention Kernel** | FlashAttention-4: Warp-Specialized Pipeline | Princeton × Together AI, 2026.03 | 🚧 |
+| **推理系统** | Executor Build-Ahead 快速路径 | 腾讯 KsanaLLM 实习 | ✅ |
 
 ---
 
@@ -32,12 +33,13 @@
 ```
 ai-infra-lab/
 ├── projects/
-│   ├── dspark/              # DSpark 投机解码框架
-│   ├── quant_2bit/          # 2-bit 极低比特量化
-│   └── flash_attn/          # FlashAttention-4 机制复现
-├── common/                  # 共享工具
-├── docs/                    # 技术深度文档
-└── tests/                   # 测试
+│   ├── dspark/                  # DSpark 投机解码框架
+│   ├── quant_2bit/              # 2-bit 极低比特量化
+│   ├── flash_attn/              # FlashAttention-4 机制复现
+│   └── ksanallm-build-ahead/    # KsanaLLM Build-Ahead 核心实现
+├── common/                      # 共享工具
+├── docs/                        # 技术深度文档
+└── tests/                       # 测试
 ```
 
 ---
@@ -75,7 +77,7 @@ DSpark 是 DeepSeek 与北京大学 2026 年 6 月联合发布的投机解码框
 ICLR 2026 是极低比特量化的爆发年，我们聚焦两个最具颠覆性的工作：
 
 - **BBQ**: 概率积分变换将高斯分布拉平为均匀分布再量化，2-bit 比 QuEST 降 PPL 5 点
-- **QAT for Reasoning**: <1B tokens 微调让 2-bit Qwen3-8B 在 MATH-500 达 80.4，超越 BitNet1.58 的 4T tokens 从头训练
+- **QAT for Reasoning**: <1B tokens 微调让 2-bit Qwen3-14B 在 MATH-500 达 80.4，超越 BitNet1.58 的 4T tokens 从头训练
 
 ### 我们的优化
 
@@ -100,6 +102,23 @@ FA4 针对 NVIDIA Blackwell 架构重新设计，B200 上达到 71% 硬件利用
 1. Hopper/Ada Lovelace 架构简化实现
 2. GQA/MQA shared KV 访存优化
 3. RMSNorm + RoPE kernel 融合
+
+---
+
+## 🏭 方向四：KsanaLLM Executor Build-Ahead
+
+### 核心技术
+
+来自腾讯 KsanaLLM 实习的核心产出。一种跨 step 的流水线深度优化机制：
+
+- **双 Slot 乒乓**：两个 slot 各自独立 ModelInput/H2D stream/Sampler buffer，Preprocess 与 Forward 并行
+- **Ring Buffer 协议**：`int64[1 + 2×max_batch_size]` 布局，ReplaceLastTokenKernel + WriteRingKernel 跨步传递采样结果
+- **Placeholder 机制**：Engine 用 `kFastPathPlaceholderTokenId = -1` 占位，Executor 侧 Forward 前回填
+- **FastPathController**：启动期 13 项硬条件 Gate，不做运行时判断
+
+### 设计文档
+
+详见 [projects/ksanallm-build-ahead/](projects/ksanallm-build-ahead/) 及内部设计文档 `build-ahead-mtp-serial.md`。
 
 ---
 

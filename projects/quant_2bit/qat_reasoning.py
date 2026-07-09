@@ -2,7 +2,7 @@
 QAT for Ultra-Low-Bit Reasoning LLMs — ICLR 2026 论文复现
 
 核心突破:
-  用 <1B tokens 的 QAT 微调让 2-bit Qwen3-8B 在 MATH-500 达到 80.4,
+  用 <1B tokens 的 QAT 微调让 2-bit Qwen3-14B 在 MATH-500 达到 80.4,
   超越 BitNet1.58 用 4T tokens 从头训练的 43.4.
 
 两阶段流水线:
@@ -500,7 +500,7 @@ def bitnet_distillation_comparison():
       - BitNet1.58 2B4T: 用 4T tokens 从头训练, MATH-500 = 43.4
 
     BitNet Distillation (QAT for Reasoning):
-      - Qwen3-8B FP16 预训练 (已有)
+      - Qwen3-14B FP16 预训练 (已有)
       - 2-bit QAT 微调 <1B tokens
       - MATH-500 = 80.4
 
@@ -508,7 +508,7 @@ def bitnet_distillation_comparison():
     """
     comparison = {
         "Method": ["BitNet from-scratch", "QAT for Reasoning (ours)"],
-        "Model": ["BitNet1.58 2B4T", "Qwen3-8B @ 2-bit"],
+        "Model": ["BitNet1.58 2B4T", "Qwen3-14B @ 2-bit"],
         "Training Data": ["4T tokens", "< 1B tokens"],
         "MATH-500": [43.4, 80.4],
         "Training Efficiency": ["1x (baseline)", ">4000x"],

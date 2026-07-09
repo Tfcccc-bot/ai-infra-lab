@@ -1,0 +1,306 @@
+/* Copyright 2024 Tencent Inc.  All rights reserved.
+
+==============================================================================*/
+#pragma once
+
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "device/device_types.h"
+#include "distributed/raw_packet.h"
+#include "runtime/executor_infer_request.h"
+#include "runtime/infer_request.h"
+#include "runtime/profile_metrics.h"
+#include "utils/blocking_queue.h"
+#include "utils/request.h"
+#include "utils/status.h"
+
+namespace ksana_llm {
+
+// Launch 时刻的 req 字段快照, 用于消除 LaunchPlanningTask 与异步 IPC 序列化之间的竞争.
+//
+// 背景: max_depth=2 时 schedule N+1 可在 N 的 IPC 发出前 launch, N+1 会修改 req->forwarding_tokens 等字段;
+//       若序列化仍读 live req->*, Executor 收到的 step N 数据会被 N+1 污染 (末位 placeholder/长度错位).
+// 用法: LaunchScheduleOutput 在持有 schedule_mutex_ 时深拷贝; SerializeScheduleOutput 优先读 snapshot.
+// slow path (max_depth=1) 虽无并发 launch, 同样走 snapshot 以保持路径统一且结果等价.
+struct InferRequestSerializationSnapshot {
+  std::vector<int> forwarding_tokens;
+  // build-ahead placeholder 步在 forwarding_tokens 中的下标；无 placeholder 时为 SIZE_MAX。
+  size_t placeholder_offset_in_snapshot = std::numeric_limits<size_t>::max();
+  size_t kv_cached_token_num = 0;
+  size_t forwarding_tokens_draft_num = 0;
+  size_t sampling_token_num = 0;
+  std::vector<int> kv_cache_blocks;
+  std::vector<int> swa_kv_cache_blocks;
+  std::vector<size_t> swa_kv_cache_block_idx_offsets;
+  int prefix_cache_len = 0;
+  int step = 0;
+  ForwardStepKind forward_step_kind = ForwardStepKind::kPrefill;
+  // patch_transfer 由 ModelDriver::SetInferRequestTransferMode 决策; 相邻 schedule_id 会覆写 req->patch_transfer,
+  // 故序列化读 snapshot 而非 live 字段, 避免 prefill 首步误走 patch 路径.
+  bool patch_transfer = false;
+  bool patch_transfer_populated = false;
+};
+
+// The scheduler output of every step.
+struct ScheduleOutput {
+  // Make it empty again, but keep runing reqs, called only on master node.
+  void ResetDataForWorkers() {
+    finish_req_ids.clear();
+    recompute_req_ids.clear();
+    structured_generator_configs.clear();
+    need_create_generator_req_ids.clear();
+    req_serialization_snapshots.clear();
+    live_req_ids.clear();
+  }
+
+  // 检查 batch 内本轮真正要 launch 的 req 是否还能再 push 一个 inflight task.
+  // max_depth=1: 要求 inflight_count_==0 (slow path); max_depth=2: 允许 inflight_count_<=1 (fast path).
+  bool IsLaunchable(size_t max_depth = 1) const {
+    bool has_planning_task = false;
+    for (const auto& req : running_reqs) {
+      if (req->IsStopped()) {
+        continue;
+      }
+      if (!req->HasPlanningTask()) {
+        continue;
+      }
+      has_planning_task = true;
+      if (!req->HasInflightCapacity(max_depth)) {
+        return false;
+      }
+    }
+    return has_planning_task;
+  }
+
+  void SetPlanningTask() {
+    for (auto req : running_reqs) {
+      req->SetPlanningTask();
+    }
+  }
+
+  // 是否还有请求持有未消费的 planning_task。
+  // 用于 ScheduleProcessor 判断一份因 pipeline 打满被缓存、之后 launch 全部落空的 ScheduleResult
+  // 是否已彻底陈旧 (所有请求的 planning_task 都被别的路径消费掉), 从而决定丢弃而非继续重放.
+  bool HasAnyPlanningTask() const {
+    for (const auto& req : running_reqs) {
+      if (!req->IsStopped() && req->HasPlanningTask()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 将 planning_task 推入各 req 的 inflight 队列并构造 forwarding_tokens.
+  // 若 req 已有在飞 step (HasInflightTask), 末位写 placeholder, 真实 token 由 Executor ReplaceKernel 回填;
+  // 否则直接 append generated_tokens (slow path 或 fast path 首步).
+  // 返回值: 是否真正 launch 了至少一个请求。
+  // 场景: build-ahead pipeline 打满时该 ScheduleOutput 会被 ScheduleProcessor 缓存等待重试;
+  // 重放时若该请求的 planning_task 已被别的路径消费掉 (HasPlanningTask()==false), 必须跳过而不是
+  // 断言崩溃; 调用方据此返回值判断是否需要丢弃这份陈旧缓存, 避免下发"幽灵 patch".
+  bool LaunchScheduleOutput(size_t max_depth = 1) {
+    if (!IsLaunchable(max_depth)) {
+      return false;
+    }
+    bool launched_any = false;
+    for (const auto& req : running_reqs) {
+      if (req->IsStopped()) {
+        continue;  // request may be finished in async mode.
+      }
+      if (!req->HasPlanningTask()) {
+        continue;  // planning_task 已被消费, 该请求本轮无新 step 可 launch.
+      }
+      launched_any = true;
+      const bool use_placeholder_for_last_token = req->HasInflightTask();
+      req->LaunchPlanningTask(use_placeholder_for_last_token);
+      // 在 schedule_mutex_ 保护下固化易竞态字段, 供后续异步 IPC 序列化使用 (见 InferRequestSerializationSnapshot).
+      auto& snap = req_serialization_snapshots[req->req_id];
+      snap.forwarding_tokens = req->forwarding_tokens;
+      if (use_placeholder_for_last_token) {
+        const size_t ph_off = req->GetLatestPendingPlaceholderOffset();
+        snap.placeholder_offset_in_snapshot = ph_off;
+      } else {
+        snap.placeholder_offset_in_snapshot = std::numeric_limits<size_t>::max();
+      }
+      snap.kv_cached_token_num = req->kv_cached_token_num;
+      snap.forwarding_tokens_draft_num = req->forwarding_tokens_draft_num;
+      snap.sampling_token_num = req->sampling_token_num;
+      snap.kv_cache_blocks = req->kv_cache_blocks;
+      snap.swa_kv_cache_blocks = req->swa_kv_cache_blocks;
+      snap.swa_kv_cache_block_idx_offsets = req->swa_kv_cache_block_idx_offsets;
+      snap.prefix_cache_len = req->prefix_cache_len;
+      snap.step = req->step;
+      snap.forward_step_kind = req->forward_step_kind;
+    }
+    return launched_any;
+  }
+
+  // Make it empty again, called only on worker node.
+  void Clear() {
+    ResetDataForWorkers();
+    running_reqs.clear();
+    executor_running_reqs.clear();
+  }
+
+  void ClearRunningReqs() {
+    running_reqs.clear();
+    executor_running_reqs.clear();
+  }
+
+  size_t schedule_id = DEFAULT_SCHEDULE_ID;
+
+  // 当激活 ModelPerfBackend 时置为 true，通知 Executor 采集并回传 ProfileMetrics。
+  // 仅 Engine 主进程填充；Executor 反序列化后的 ScheduleOutput 中该字段也会保留。
+  bool enable_profile_metrics = false;
+
+  // Engine 侧在 DispatchScheduleOutput 前记录的 CPU 时间戳（纳秒）。
+  // 仅 enable_profile_metrics=true 时有意义；Executor 在首次 forward 开始时读取，
+  // 计算 profile_metrics.schedule_forward_interval_ns。
+  int64_t schedule_dispatch_time_ns = 0;
+
+  // step 级 ProfileMetrics 聚合区指针（Executor 本地设置，不参与 IPC 序列化）。
+  // 主 forward 为 nullptr，MTP postprocess 指向 sampling_output->profile_metrics，供多次 forward 累加 speculative
+  // 子项。
+  ProfileMetrics* step_metrics = nullptr;
+
+  // NOTE(karlluo): finished req ids, outer vector is for attention data parallelism.
+  std::vector<std::vector<int64_t>> finish_req_ids;
+
+  // recompute requests, should transfer the full struct.
+  std::vector<std::vector<int64_t>> recompute_req_ids;
+
+  // running, for master node.
+  std::vector<std::shared_ptr<InferRequest>> running_reqs;
+
+  // running, for executor process.
+  std::vector<std::shared_ptr<ExecutorInferRequest>> executor_running_reqs;
+
+  // The incremental patch for running queue.
+  std::vector<std::shared_ptr<InferRequestPatch>> running_req_patches;
+
+  // Engine 调度时仍在生命周期内的请求 id。Executor 用它清理 finish 信号滞后的资源，
+  // 不能用当前 compute batch 代替，否则会误释放暂时等待 block 的请求状态。
+  std::vector<int64_t> live_req_ids;
+
+  // Structured generator configs for creating generators on Executor side
+  // Only transmitted on first inference or after preemption recovery
+  std::unordered_map<int64_t, StructuredGeneratorConfig> structured_generator_configs;
+
+  // Request IDs that need to create generators on Executor side
+  std::unordered_set<int64_t> need_create_generator_req_ids;
+
+  // req_id → Launch 时刻快照 (见 InferRequestSerializationSnapshot).
+  // 仅 Engine 主进程填充; Executor 反序列化得到的 ScheduleOutput 中此 map 为空.
+  std::unordered_map<int64_t, InferRequestSerializationSnapshot> req_serialization_snapshots;
+};
+
+struct ScheduleOutputGroup {
+ public:
+  size_t schedule_id = DEFAULT_SCHEDULE_ID;
+  std::vector<ScheduleOutput*> outputs;
+
+ public:
+  explicit ScheduleOutputGroup(size_t dp_num = 1) : schedule_id(DEFAULT_SCHEDULE_ID) {
+    outputs.resize(dp_num, nullptr);
+  }
+
+  size_t RunningSize() const {
+    size_t size = 0;
+    for (auto& output : outputs) {
+      if (output == nullptr) {
+        continue;
+      }
+      size += output->running_reqs.size();
+    }
+    return size;
+  }
+};
+
+// Forward declare.
+class ScheduleProcessorInterface;
+
+class ScheduleOutputParser {
+ public:
+  // We just assume the data memory is large enough, and do not check it.
+  static Status SerializeScheduleOutput(const ScheduleOutput* schedule_output, void* ptr, size_t* bytes);
+  static Status DeserializeScheduleOutput(const void* ptr, ScheduleOutput* schedule_output);
+
+  // Get the serialized byte of a ScheduleOutput object.
+  static size_t GetSerializedSize(const ScheduleOutput* schedule_output);
+
+  // Set schedule processor.
+  static void SetScheduleProcessor(const std::shared_ptr<ScheduleProcessorInterface> schedule_processor);
+
+ private:
+  static std::shared_ptr<ScheduleProcessorInterface> schedule_processor_;
+};
+
+// An object pool for schedule output.
+class ScheduleOutputPool {
+ public:
+  // Get a schedule output object.
+  ScheduleOutput* GetFreeScheduleOutput();
+
+  // Free the schedule output to object pool.
+  Status FreeScheduleOutput(ScheduleOutput* schedule_output);
+
+  // Put and get send buffer.
+  void PutSendScheduleOutput(ScheduleOutput* schedule_output);
+  Packet* GetSendSerializedPacket();
+
+  // Put and get serialized packet.
+  void PutRecvSerializedPacket(Packet* packet);
+  Packet* GetRecvSerializedPacket();
+
+  // All blocked queue will be returned immediately.
+  Status Stop();
+
+ private:
+  BlockingQueue<ScheduleOutput*> free_queue_;
+
+  // The serialized packet that ready to send.
+  BlockingQueue<Packet*> serialized_send_queue_;
+
+  // The serialized packet from master node.
+  BlockingQueue<Packet*> serialized_recv_queue_;
+};
+
+struct GenerationOutputGroup {
+  size_t multi_batch_id = DEFAULT_MULTI_BATCH_ID;
+
+  std::vector<std::vector<std::shared_ptr<InferRequest>>> reqs;
+
+  // Batch-level performance metrics forwarded from SamplingOutput.
+  bool has_profile_metrics = false;
+  ProfileMetrics profile_metrics;
+
+  void Reset() {
+    reqs.clear();
+    has_profile_metrics = false;
+    profile_metrics = ProfileMetrics{};
+  }
+
+  void BuildFromScheduleOutputGroup(const ScheduleOutputGroup& schedule_output_group) {
+    reqs.resize(schedule_output_group.outputs.size());
+    for (size_t i = 0; i < schedule_output_group.outputs.size(); ++i) {
+      auto& output = schedule_output_group.outputs[i];
+      if (output == nullptr) {
+        continue;
+      }
+      reqs[i] = output->running_reqs;
+    }
+  }
+};
+
+inline bool RemoveRequestFromQueue(std::vector<std::shared_ptr<InferRequest>>& req_queue,
+                                   const std::shared_ptr<InferRequest>& req) {
+  auto it = std::find(req_queue.begin(), req_queue.end(), req);
+  if (it != req_queue.end()) {
+    req_queue.erase(it);
+    return true;
+  }
+  return false;
+}
+
+}  // namespace ksana_llm
