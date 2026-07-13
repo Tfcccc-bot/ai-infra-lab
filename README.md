@@ -13,7 +13,7 @@
 
 ## 📋 项目概述
 
-本项目对 **2025-2026 年 AI Infra 领域最新技术** 进行深入研究和工程实现，涵盖投机解码、极低比特量化与 Attention Kernel 优化三大方向，旨在推动大模型推理效率的前沿探索。
+本项目对 **2025-2026 年 AI Infra 领域最新技术** 进行深入研究和工程实现，涵盖投机解码、极低比特量化、Attention Kernel 优化与推理系统四大方向，旨在推动大模型推理效率的前沿探索。
 
 ### 技术路线图
 
@@ -23,8 +23,14 @@
 | **投机解码** | EAGLE-3: On-Policy Multi-Layer Feature Fusion | NeurIPS 2025 | 📋 |
 | **极低比特量化** | BBQ: Bell Box Quantization | ICLR 2026 | 🚧 |
 | **极低比特量化** | QAT for Ultra-Low-Bit Reasoning LLMs | ICLR 2026 | 📋 |
+| **投机解码** | DSpark: Confidence-Scheduled Speculative Decoding | DeepSeek × PKU, 2026.06 | 🚧 |
+| **投机解码评测** | Speculative Decoding: Performance or Illusion? | MLSys 2026 (Ion Stoica 组) | 🚧 |
+| **极低比特量化** | BBQ: Bell Box Quantization | ICLR 2026 | 🚧 |
+| **极低比特量化** | QAT for Ultra-Low-Bit Reasoning LLMs | ICLR 2026 | 📋 |
+| **KV Cache 量化** | Kitty: 2-bit KV Cache (Dynamic Channel Precision) | MLSys 2026 | 🚧 |
 | **Attention Kernel** | FlashAttention-4: Warp-Specialized Pipeline | Princeton × Together AI, 2026.03 | 🚧 |
 | **推理系统** | Executor Build-Ahead 快速路径 | 腾讯 KsanaLLM 实习 | ✅ |
+| **推理系统** | Beyond the Buzz: P/D Disaggregation 祛魅 | MLSys 2026 | 🚧 |
 
 ---
 
@@ -34,9 +40,12 @@
 ai-infra-lab/
 ├── projects/
 │   ├── dspark/                  # DSpark 投机解码框架
+│   ├── specdec_illusion/        # 投机解码评测：Performance or Illusion?
 │   ├── quant_2bit/              # 2-bit 极低比特量化
+│   ├── kitty_kv2bit/            # Kitty 2-bit KV Cache 量化
 │   ├── flash_attn/              # FlashAttention-4 机制复现
-│   └── ksanallm-build-ahead/    # KsanaLLM Build-Ahead 核心实现
+│   ├── ksanallm-build-ahead/    # KsanaLLM Build-Ahead 核心实现
+│   └── pd_disaggregation/       # P/D 分离祛魅
 ├── common/                      # 共享工具
 ├── docs/                        # 技术深度文档
 └── tests/                       # 测试
@@ -70,7 +79,23 @@ DSpark 是 DeepSeek 与北京大学 2026 年 6 月联合发布的投机解码框
 
 ---
 
-## 🔬 方向二：2-bit 极低比特量化
+## 📊 方向二：投机解码评测（Performance or Illusion?）
+
+> 来源：Speculative Decoding: Performance or Illusion?（MLSys 2026, Ion Stoica 组）
+
+### 核心技术
+
+- **Throughput-Optimal 评测设定**：在固定系统吞吐约束下区分"真实加速"与"仅压低单请求延迟、却牺牲系统吞吐"的假象。
+- **开销-收益剖析**：剖析 draft 模型的额外算力成本是否被接受率 / 验证 step 数真正覆盖。
+
+### 我们的优化
+
+1. **迁移到自研部署选型**：将评测方法用于 **EAGLE / MTP / DSpark** 三套 draft 策略的线上参数决策。
+2. **数据驱动决策**：为 γ、draft 模型规模、budget 提供基于实测接受率-开销权衡的选型依据，避免"看着快、实则亏"。
+
+---
+
+## 🔬 方向三：2-bit 极低比特量化
 
 ### 核心技术
 
@@ -87,7 +112,23 @@ ICLR 2026 是极低比特量化的爆发年，我们聚焦两个最具颠覆性�
 
 ---
 
-## ⚡ 方向三：FlashAttention-4 机制复现
+## 💎 方向四：Kitty · 2-bit KV Cache 量化
+
+> 来源：Kitty（MLSys 2026）— 2-bit KV Cache 量化，以动态通道精度提升保护关键通道。
+
+### 核心技术
+
+- **Dynamic Channel-wise Precision Boost**：识别对 attention 输出贡献高的关键通道，为其分配更高有效精度，将量化误差集中在次要通道。
+- 在 **2-bit 极限压缩**下维持长上下文精度，避免均匀 2-bit 量化对关键维度"一刀切"带来的精度崩塌。
+
+### 我们的优化
+
+1. **Kitty × BBQ 联合压缩**：将 Kitty 的动态通道保护机制与 Momenta 的 **BBQ 概率积分变换量化**结合，用于 KsanaLLM 长上下文 KV Cache 压缩（KV INT2 + 通道重要性重排）。
+2. **显存-精度曲线评估**：对比 INT8 baseline，量化极致压缩下的显存节省与长文精度损失，为长文档 / 端侧场景提供压缩选型依据。
+
+---
+
+## ⚡ 方向五：FlashAttention-4 机制复现
 
 ### 核心技术
 
@@ -105,7 +146,7 @@ FA4 针对 NVIDIA Blackwell 架构重新设计，B200 上达到 71% 硬件利用
 
 ---
 
-## 🏭 方向四：KsanaLLM Executor Build-Ahead
+## 🏭 方向六：KsanaLLM Executor Build-Ahead
 
 ### 核心技术
 
@@ -119,6 +160,22 @@ FA4 针对 NVIDIA Blackwell 架构重新设计，B200 上达到 71% 硬件利用
 ### 设计文档
 
 详见 [projects/ksanallm-build-ahead/](projects/ksanallm-build-ahead/) 及内部设计文档 `build-ahead-mtp-serial.md`。
+
+---
+
+## 🔀 方向七：P/D 分离祛魅（Beyond the Buzz）
+
+> 来源：Beyond the Buzz: A Pragmatic Take on Inference Disaggregation（MLSys 2026）
+
+### 核心技术
+
+- **祛魅式评估**：指出 P/D 分离并非总是有益——在 prefill/decode 负载失衡、KV 传输带宽受限等场景下反而引入额外开销。
+- **部署决策框架**：基于负载特征（请求长度分布、并发模式、硬件拓扑）判断何时该 P/D 分离、何时该混合部署。
+
+### 我们的优化
+
+1. **结合 KsanaLLM 真实业务负载**：对 chat / 长文档 / code 三类业务分别做 P/D 分离 vs 混合部署的 break-even 分析。
+2. **数据支撑选型**：为团队 P/D 架构选型提供数据依据，避免盲目跟风导致的过度工程化。
 
 ---
 
@@ -140,6 +197,15 @@ python projects/quant_2bit/bbq.py --model Qwen/Qwen2.5-0.5B --bits 2
 
 # 运行 FA4 benchmark
 python projects/flash_attn/benchmark.py --impl warp_specialized
+
+# 运行 Kitty 2-bit KV Cache 复现
+python projects/kitty_kv2bit/repro.py --model Qwen/Qwen3-8B --kv_bits 2
+
+# 运行投机解码评测（覆盖 EAGLE / MTP / DSpark）
+python projects/specdec_illusion/eval.py --method eagle --gamma 5 --max_len 4096
+
+# 运行 P/D 分离 break-even 分析
+python projects/pd_disaggregation/breakeven.py --workload chat --kv_bw 50
 ```
 
 ---
