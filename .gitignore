@@ -1,4 +1,4 @@
-# AI Infra Lab
+# KsanaLLM Executor Build-Ahead
 
 __pycache__/
 *.pyc
@@ -8,6 +8,3 @@ checkpoints/
 *.bin
 *.safetensors
 .DS_Store
-
-# Private files (not for public repo)
-docs/interview_prep.md
