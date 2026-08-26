@@ -155,3 +155,29 @@
 - 关键效果（设计落地）：拓扑图成为 fork 内 IB 映射/亲和/评分的唯一事实来源；「静态全局 IB 列表」被替换为拓扑感知映射；所有跨 NUMA 兜底都显式降级、可观测。
 - 已知缺口（留真机）：`probe_local_topology` 默认走 sysfs 探测 GPU NUMA（/sys/class/drm）+ IB NUMA（/sys/class/infiniband/<dev>/device/numa_node），缺数据时可经 `SGLANG_TOPOLOGY_PROBE_JSON` 注入 env_probe JSON；T4/T5 在 sglang worker/router 的实际挂钩点需在真机定位。
 - 回退点：`pdv2-t3`（待首个 fork commit 后打 tag）。
+
+---
+
+## D1 — PD v2 决策核心 + 整套管理（对齐 KsanaLLM 真实实现，2026-08-26）
+
+- **关键纠偏**：T5 计划的 `TopologyAwarePolicy`（复用 M3 静态 `score_pair`）与 KsanaLLM 真实实现**不一致**。真实核心是 **LinUCB 上下文赌博机 + 生产者-消费者 + 延迟/即时奖励结算 + 快照驱动 peer 管理**。本批次据此重建，`bandit/`+`management/` 全程 TDD（先读 KsanaLLM C++ → 写单测定义行为 → 实现 → 跑绿）。
+- **新增（ai-infra-lab prototype `projects/pd_v2/`）**：
+  - `bandit/`：
+    - `linucb_math.py`（A 数学原语）：`ScaledIdentity`/对角矩阵、`ShermanMorrisonUpdate`、`UCB` 打分 —— 对齐 `csrc/pd_v2/decode/linucb_math.h`。
+    - `reward.py`（B 奖励函数）：`LocalReward`/`TtftCredit`/`RemoteReward`（[0,1] 门控；LOCAL 延迟结算、REMOTE 即时结算）—— 对齐 `csrc/pd_v2/decode/linucb_router.cpp`。
+    - `router.py`（C 双臂选择器）：`LinUCBRouter`（`BuildFeatures` 4 维特征 / `SelectArm` 平局偏 REMOTE / `RecordReward` 在线更新 Ainv、b）—— 对齐 `linucb_router.{h,cpp}`。
+    - `route_decision.py`（D 决策流）：`decide_route` 纯函数（warmup/空 prefill/kv 全命中/前缀覆盖/阈值 bypass + local/remote 分流）+ `PrefillRouter`（生产者-消费者投递 + 延迟/即时奖励结算；pending 带 arm 标签按臂校验）—— 对齐 `csrc/pd_v2/decode/pd_v2_decode_hook.cpp::Process`。
+  - `management/`：
+    - `peer_selector.py`（E）：快照驱动路由表，`RegisterPeer`/`UpdateSnapshot`/`Select`（按 segment_id 升序 round-robin），**无 per-request 簿记** —— 对齐 `csrc/pd_v2/decode/peer_selector.cpp`。
+    - `alive_store.py`（F1）：`AliveStore` 接口 + `FakeAliveStore`（TTL）+ `KeepaliveAgent`（键 `pd_v2/decode_alive/<cluster>/<addr>`、epoch JSON、TTL 5s/续租 2s/关闭 DEL）—— 对齐 `mooncake_engine_connector_discovery.cpp §3.3`。
+    - `discovery.py`（F2）：`SnapshotReceiver`（decode `OnPrefillSnapshot`）/ `SnapshotBroadcaster`（prefill `BroadcastSnapshot`，S3 Redis 发现 vs S1 自发现回退、epoch diff：first_seen/restarted/disappeared）/ `ReverseRouteTable`（入站 reverse-route 配对）—— 对齐 `discovery.cpp`。
+    - `topology_integration.py`（G）：**直接复用** `topology/score_pair` + `topology_graph`，把 IB 亲和度作为 `TopologyAwarePeerSelector` 的 peer 排名输入（同 NUMA=1.0、跨 NUMA 按 `gpu_nic_distance` 衰减、缺信息不偏置）—— 复用 T3 `auto` IB 解析结果作 `peer_ib` 输入。
+    - `types.py`：`PeerHealth`/`PrefillSnapshot`/`StageAssignment`/`IncomingPrefillRequest` 对齐 `pd_v2_types.h`。
+- **单测**（预期结果 → 实际）：`tests/test_linucb_*.py` + `test_route_decision.py`（37 例）+ `test_peer_selector.py`/`test_alive_store.py`/`test_discovery.py`/`test_topology_integration.py`（36 例）= **73 例全绿**。
+  - UCB 探索-利用：闭环中被持续奖励的臂最终胜出；未更新臂的高 bonus 不会永久压制（自适应本质）✅
+  - 奖励结算：LOCAL/REMOTE 奖励正确写入对应臂 bandit 状态；端到端占优臂胜出 ✅
+  - PeerSelector：快照唯一真相、epoch 旋转按 server_name 复用 segment_id、跨 NUMA 跳过 ✅
+  - discovery：S3 发现跳过自己/无效键、S1 回退、epoch diff（restarted/disappeared）✅
+  - topology 接入：同 NUMA=1.0、跨 NUMA 衰减、无偏置回退 round-robin ✅
+- **H 落点（只读定位，未实现）**：见 TODOS 进度快照。核心发现 = sglang fork 的 PD 为 **bootstrap 模型**、decode 实例**不跑 prefill**；须 **co-locate 同节点 prefill 实例**，使 `decide_route` 选 local（同节点）/remote（跨节点）prefill 实例。落点：① `scheduler.py::_add_request_to_queue`（`disagg_prefill_bootstrap_queue.add`，约 2811 行）挂 `decide_route`；② `decode.py::_resolve_prefill_dp_rank`（661 行）挂 `PeerSelector.select()`；③ `mooncake/conn.py` 连接层 + `arg_groups/pd_disaggregation_hook.py`(148) 挂 Snapshot/Alive 生命周期。需注入：`LinUCBRouter`+`TopologyAwarePeerSelector`+`AliveStore(Redis)`+`SnapshotReceiver`(decode) / `SnapshotBroadcaster`+`ReverseRouteTable`(prefill)。
+- **回退点**：ai-infra-lab commit `c4ef9b1`（分支 `pd-v2-docs`，24 文件 / +2274 行；未推送，按用户要求仅本地提交）。

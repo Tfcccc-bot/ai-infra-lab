@@ -99,3 +99,21 @@
 
 - [ ] 纯 Python 原型回退点先打 `pdv2-m0` … `pdv2-m6`
 - [ ] 每个 T 任务完成打轻量 tag（如 `pdv2-t3`），便于二分回退
+
+## 进度快照（2026-08-26 决策核心 + 整套管理落地）
+
+> 本批次纠偏：先前 T5 的「静态 `TopologyAwarePolicy`」与 KsanaLLM 真实实现不符；
+> 真实核心是 **LinUCB 上下文赌博机 + 生产者-消费者 + 延迟/即时奖励 + 快照驱动 peer 管理**。
+> 据此在 `ai-infra-lab` prototype 重建 `bandit/`+`management/`，全程 TDD，73 例单测全绿
+> （commit `c4ef9b1`，分支 `pd-v2-docs`，未推送）。
+
+- **A 数学原语 / B 奖励函数 / C 双臂选择器 / D 决策流**：✅ `bandit/`（37 单测）。`LinUCBRouter` 平局偏 REMOTE、在线 Sherman-Morrison 更新、UCB 探索-利用收敛验证通过。
+- **E PeerSelector / F1 AliveStore+Keepalive / F2 发现+广播+配对 / G 拓扑接入**：✅ `management/`（36 单测）。快照驱动路由表、Redis 存活键 epoch 协议、S3/S1 发现回退、reverse-route 配对、复用 `topology/` 作 peer 亲和度排名。
+- **T5 重写说明**：T5 的实际实现 = `bandit/router.py`(LinUCB) + `management/peer_selector.py`，已 **supersede** 原计划的静态 `TopologyAwarePolicy`；`NaivePolicy` 对照概念保留。
+- **H 落点已定位（未实现）**：
+  - sglang fork PD = bootstrap 模型、decode 实例不跑 prefill → 须 **co-locate 同节点 prefill 实例**，使 `decide_route` 选 local/remote prefill 实例。
+  - 落点① `scheduler.py::_add_request_to_queue`（~2811 行 `disagg_prefill_bootstrap_queue.add`）挂 `decide_route`；
+  - 落点② `decode.py::_resolve_prefill_dp_rank`（661 行）挂 `PeerSelector.select()`；
+  - 落点③ `mooncake/conn.py` 连接层 + `pd_disaggregation_hook.py`(148) 挂 Snapshot/Alive 生命周期。
+  - 注入接口：`LinUCBRouter` + `TopologyAwarePeerSelector` + `AliveStore(Redis)` + `SnapshotReceiver`(decode) / `SnapshotBroadcaster` + `ReverseRouteTable`(prefill)。
+- **下一步（H，待用户授权）**：把 `bandit/`+`management/` 移植进 sglang 为 `sglang/srt/disaggregation/pdv2/`，按落点焊接；真机验证（本机 `import sglang` 失败，无法离线单测）。
