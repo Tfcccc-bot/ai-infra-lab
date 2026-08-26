@@ -1,98 +1,101 @@
-# PD v2 on SGLang — 执行清单
+# PD v2 on SGLang — 执行清单（T1–T9）
 
-> 这是把规划文档落成可勾选的执行清单。按顺序推进，M0/M1 是硬前提。
-> 依赖关系：`M0 → M1 → {M2 安全网, M3 第一主线} → M4 → M5 → M6 → M7`。
+> 本清单是 `FORK_PLAN.md` 任务拆解的落地勾选版，每个任务可独立验收。
+> 纪律：**先补单测与 FORK_PLAN 对应小节 → 实现 → 补 DEVLOG.md 一节 → 勾掉**。
+> 纯 Python 原型 M0–M6 已完成（48 单测全绿），作为 fork 落地的 spec / 参考实现。
+> 边界、单测计划、不变量见 `FORK_PLAN.md`；决策与进展见 `WORKLOG.md`。
 
-## 现在就能动手的第一刀
+## 准备（前置，阻塞于 GitHub 公钥）
 
-- [ ] `bash launcher/env_probe.sh`，确认能拿到拓扑 JSON
-- [ ] Fork `sgl-project/sglang`，固定基线 commit `67853c5`，建 `pd-v2-topology` 分支
-- [ ] 确定首个模型/硬件：建议 Qwen3-8B、2 GPU 单机（有 RDMA 再扩 1P1D 跨机）
+- [ ] 公钥 `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFbxxz8dixLmX8twZ6wzIo1Zuvg0D7GRJmCQVSqJRtq3 fangtang` 加到 GitHub，`ssh -T git@github.com` 通过
+- [ ] clone 自己账户下的 fork + `git remote add upstream https://github.com/Tfcccc-bot/sglang.git` + `git fetch upstream 67853c5` + `git checkout -b pd-v2-topology 67853c5`
 
----
+## T1 — Fork 接入与基线锁定
 
-## M0：范围冻结与基线固定
+- [x] 分支 `pd-v2-topology`，HEAD = `67853c5`（已创建，基线锁定）
+- [ ] `python -c "import sglang"` 成功
 
-- [ ] Fork SGLang，固定基线 commit `67853c5`，创建 `pd-v2-topology` 分支
-- [ ] 在 README 明确目标顺序：topology-aware → state-machine hardening → fast-blockwise
-- [ ] 确认首个模型与硬件（Qwen3-8B / 2 GPU 单机起步）
-- [ ] 写环境探测脚本：GPU、PCIe、NUMA、NIC/HCA、RDMA、Mooncake 版本
-- [ ] 固化软件版本清单（cuda / torch / sglang / mooncake / rdma-core）
+**验收**：分支/commit 锁定，sglang 可导入。可判断完成。
 
-**验收**：能输出可复现的软件版本、拓扑 JSON、启动配置。
+## T2 — 真机拓扑探测接入 M1 topology
 
-## M1：SGLang 原生 PD 基线
+- [ ] `launcher/env_probe.sh` 真机产出 `topology-<host>.json`
+- [ ] 扩 `tests/test_topology_probe.py`：真机 JSON 还原 GPU↔NUMA↔NIC；`per_gpu_ib_device` 满足同 NUMA 时 `downgraded=False`
+- [ ] 真机 JSON 通过 M1 单测
 
-- [ ] 启动 1P1D + Router，先用 Mooncake；无 RDMA 先跑 fake / NIXL 本地路径
-- [ ] 固化三类 workload：short-chat、long-prefill、long-decode
-- [ ] 采集 TTFT、TPOT、ITL P50/P95/P99、吞吐、KV transfer bytes/latency、bootstrap/alloc wait
-- [ ] 跑 correctness：确定性输出、并发、abort、首 token EOS、结构化输出
-- [ ] 生成统一 trace：route → bootstrap → prealloc → prefill → transfer → commit → decode
+**验收**：解析无异常。可判断完成。
 
-**验收**：baseline 一键运行；连续三次偏差可解释；请求无 KV 泄漏。
+## T3 — per-GPU IB 设备自动映射落 fork
 
-## M2：多 scheduler 状态机测试（安全网）
+- [x] 改 disaggregation 参数解析，挂 `--disaggregation-ib-device=auto`，用 M1 `topology_graph` 查询（替换静态全局 IB 列表）
+- [ ] `tests/test_ib_device_mapping.py`：P/D 命中各自 GPU 本地 IB；缺同 NUMA 时 `downgraded=True` + `reason`
+- [ ] 真机 1P1D 用 `auto` 启动成功
 
-- [ ] 基于 SGLang `fake` backend 自行实现测试场景（不搬内部测试代码）
-- [ ] 建立 room 生命周期：Created → Bootstrapping → DestPublished → Transferring → Committed / Failed / Aborted
-- [ ] 覆盖：P 先到、D 先到、bootstrap 超时、传输超时、某 TP rank 失败、重复 room、abort 与迟到 ACK、decode retraction
-- [ ] 校验不变量：各 rank 状态一致；资源只释放一次；失败不污染复用 room；无孤儿 prealloc slot
-- [ ] 加并发压力 + 随机故障注入
+**验收**：单测绿 + 真机启动成功。可判断完成。
 
-**验收**：状态机用例 1000 次随机调度稳定；失败后服务继续可用。
+## T4 — worker CPU affinity 落 fork
 
-## M3：Topology-aware PD v2（第一主线）
+- [ ] 用 M1 `bind.cpu_affinity` 在 transfer/bootstrap/staging worker 启动处加 NUMA 本地 CPU 绑定（不改 worker 内部）
+- [ ] `tests/test_affinity_bind.py`：affinity mask == GPU 本地 NUMA CPUs；非法角色 `ValueError`
+- [ ] 真机 `numactl --show` 验证绑定生效
 
-- [ ] 探测 GPU ↔ NUMA ↔ NIC/HCA 距离，生成 topology graph
-- [ ] 实现 per-GPU `--disaggregation-ib-device` 自动映射（替代静态全局列表）
-- [ ] 为 Mooncake transfer worker / bootstrap thread / staging worker 加 CPU affinity 策略
-- [ ] Router/P-D pair 评分加入：队列负载、KV 字节、GPU-NIC 距离、NUMA 跨越成本、链路带宽
-- [ ] 无法同 NUMA 时显式降级并打 metric（不静默跨 NUMA）
-- [ ] 对比 local-NUMA / cross-NUMA / auto 三组实验
+**验收**：单测绿 + 绑定生效。可判断完成。
 
-**验收**：auto 不选明显更差路径；P95 KV transfer latency 与 CPU 开销有可复现改善。
+## T5 — Router (P,D) 配对策略落 fork
 
-## M4：Stage pool 与背压
+- [ ] 新增 `TopologyAwarePolicy`（复用 M3 `score_pair`），主流程保留 `NaivePolicy` 对照（不改 Router 调度主流程）
+- [ ] `tests/test_routing_policy.py`：同 NUMA 候选优先；`rank_pairs` 升序；无候选 `ValueError`；300 请求平均成本 < 朴素
+- [ ] 可切 Naive / TopologyAware 对照
 
-- [ ] 定义统一 `TransferResourceLease`：room、KV pages、metadata slot、staging alloc、generation、owner
-- [ ] 把“地址已发布但未入 TransferQueue”的窗口纳入资源计数
-- [ ] 按 decode 可用 KV、extra slots、transfer queue 水位动态控制 prefill admission
-- [ ] 优先级区分：bootstrap / metadata(aux) / KV payload / abort(cleanup)
-- [ ] 加水位与泄漏指标：allocated / published / transferring / committed / aborted
+**验收**：单测绿 + 可对照。可判断完成。
 
-**验收**：高并发下不出现 decode 预分配死锁；队列水位有界；超时/abort 后资源归零。
+## T6 — 多 scheduler room 状态机集成
 
-## M5：Fast-blockwise（第二主线）
+- [ ] fork 用 `fake` backend 复用 M2 状态机场景（不搬内部测试代码）
+- [ ] `@skip_without_sglang` 集成用例跑 M2 的 11 类场景 + 1000 次随机调度
+- [ ] 失败注入后服务仍可服务新请求、无 KV 泄漏、无孤儿 slot
 
-- [ ] 定义 block 级协议：chunk id、token range、KV page range、last-chunk、generation
-- [ ] 做仅传输流水化 PoC：prefill chunk N+1 与 chunk N 的 KV transfer 重叠
-- [ ] Decode 在依赖块与 metadata 完整后才 commit，禁止读半成品 KV
-- [ ] 与 chunked prefill、staging、异构 TP 对齐
-- [ ] 评估与 EAGLE3/NEXTN 叠加；首版不同时改 blockwise 与 speculative 状态机
+**验收**：集成绿 + 不变量成立。可判断完成。
 
-**验收**：长 prompt 下 KV 传输被 prefill 计算部分隐藏；输出与非 blockwise 一致；失败按 room 回收全部 chunk。
+## T7 — 统一指标 + trace 接入 fork
 
-## M6：兼容性与性能矩阵
+- [ ] 启动脚本采集；trace 阶段对齐 M5 的 8 阶段（route/bootstrap/prealloc/prefill/transfer/commit/decode/e2e）
+- [ ] 用 M4/M5 单测解析真机 trace JSON，断言 TTFT/ITL/KV 派生时长正确
+- [ ] 三类 workload（short/long_prefill/long_decode）可复现
 
-- [ ] 后端：Mooncake / NIXL（fake 仅逻辑测试）
-- [ ] 拓扑：同机同 NUMA、同机跨 NUMA、跨机 RDMA
-- [ ] 并行：同 TP、P-TP>D-TP、P-TP<D-TP、DP Attention；PP/CP 作扩展
-- [ ] 功能：Radix Cache、HiCache、KV offload、EAGLE3；不兼容组合跳过并说明
-- [ ] workload：ISL/OSL/并发二维 sweep，画出分离收益与退化边界
-- [ ] 回归：accuracy、abort、node failure、timeout、资源泄漏、长稳压
+**验收**：真机 trace 通过 M4/M5 解析。可判断完成。
 
-**验收**：公开 benchmark 报告，含硬件拓扑、版本、配置、误差范围。
+## T8 — patches manifest 回填
 
-## M7：开源交付
+- [ ] 每笔 fork 提交补 `patches/manifest.json` entry，commit 从 `TBD` 填实
+- [ ] `test_patches.py` 校验必填 + 不重 + status 合法
 
-- [ ] `projects/pd_v2/` 提供设计、启动脚本、基准、测试、结果
-- [ ] SGLang fork 小提交拆分：topology discovery / affinity / routing policy / metrics / tests
-- [ ] 可复用部分提交上游 PR；实验性策略留在本仓库
-- [ ] 合规检查：不含内部文件路径、提交哈希、专有类实现、原始代码片段
+**验收**：`validate(load_manifest())` 通过，每条对应真实 commit。可判断完成。
 
-## 明确不做
+## T9 — A/B 对比报告
 
-- 不重写 SGLang 已有 Mooncake/NIXL connector
-- 不复制 KsanaLLM 内部实现或单测
-- 第一阶段不同时改 Router、传输层、scheduler、speculative decoding
-- 无基线数据前，不宣称 NUMA 或 blockwise 一定提升性能
+- [ ] 用 M5 `compare` 产出 local-NUMA / cross-NUMA / auto 三组指标 delta
+- [ ] 生成可读报告；auto 不被可用备选 dominate
+
+**验收**：报告产出，`better` 判定正确。可判断完成。
+
+## 明确不做（与 FORK_PLAN §2.3 一致）
+
+- [ ] 不复制 KsanaLLM 内部实现 / 单测
+- [ ] 不重写 SGLang 已有 Mooncake / NIXL connector
+- [ ] 第一批不同时改 Router + 传输层 + scheduler + speculative decoding
+- [ ] 无 baseline 数据前不宣称 NUMA / blockwise 一定提升性能
+- [ ] fast-blockwise / stage pool 留作第二阶段，不在本清单边界内
+
+## 进度快照（2026-08-26 迁移启动）
+
+- **T1 分支**：✅ 已创建 `pd-v2-topology` @ `67853c5`。
+- **T2 foundation**：✅ M1 topology 包已移植进 fork（`sglang.srt.disaggregation.topology`）；真机 `env_probe` JSON 接入待 T2 真机步骤。
+- **T3 auto IB**：✅ `server_args` 已挂 `auto`；离线单测 12 例全绿；真机 1P1D 启动待验证。
+- **T4 / T5 逻辑**：✅ `cpu_affinity` / `score_pair` 已随 topology 包移植并附单测；**接入 sglang worker/router 的具体 hook 点待真机定位**（fork 实际 PD 为 bootstrap 模型，无计划假设的单一 Router 配对点）。
+- **待验证阶段**：真实 `import sglang` + 真机 env_probe + 真机 1P1D 启动（T2/T3 真机部分、T4/T5 集成、T6/T7/T9）。
+
+## 回退与 tag
+
+- [ ] 纯 Python 原型回退点先打 `pdv2-m0` … `pdv2-m6`
+- [ ] 每个 T 任务完成打轻量 tag（如 `pdv2-t3`），便于二分回退

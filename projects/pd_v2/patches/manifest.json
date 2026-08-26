@@ -1,0 +1,32 @@
+[
+  {
+    "id": "T1-fork-baseline-lock",
+    "fork_repo": "Tfcccc-bot/sglang",
+    "branch": "pd-v2-topology",
+    "commit": "TBD",
+    "intent": "基于基线 67853c5 创建并切到 pd-v2-topology 分支，钉死基线",
+    "status": "done",
+    "metric_result": "",
+    "related_module": "repo"
+  },
+  {
+    "id": "T2-topology-package-port",
+    "fork_repo": "Tfcccc-bot/sglang",
+    "branch": "pd-v2-topology",
+    "commit": "TBD",
+    "intent": "将 M1 topology 包移植进 fork 为 sglang.srt.disaggregation.topology（topology_graph/probe/score/bind/auto_ib），作为 T3/T4/T5 的唯一事实来源与可单测底座",
+    "status": "implemented",
+    "metric_result": "12 离线单测全绿",
+    "related_module": "topology"
+  },
+  {
+    "id": "T3-auto-ib-device-mapping",
+    "fork_repo": "Tfcccc-bot/sglang",
+    "branch": "pd-v2-topology",
+    "commit": "TBD",
+    "intent": "server_args._validate_ib_devices 支持 --disaggregation-ib-device=auto：用拓扑图按 GPU NUMA 选 IB，无同 NUMA 显式降级",
+    "status": "implemented",
+    "metric_result": "12 离线单测全绿",
+    "related_module": "disaggregation/topology"
+  }
+]
